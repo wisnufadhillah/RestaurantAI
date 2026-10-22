@@ -22,11 +22,11 @@ export class LlmClient {
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly model: string;
-  private readonly appUrl?: string;
-  private readonly appName?: string;
 
   constructor() {
-
+    this.baseUrl = process.env.LLM_BASE_URL || process.env.OPENROUTER_BASE_URL || 'http://localhost:8000/v1';
+    this.apiKey = process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY || 'dev-key';
+    this.model = process.env.LLM_MODEL || process.env.LLM_DEFAULT_MODEL || 'hermes-3-llama-3.1-8b';
   }
 
   async chatCompletion(
@@ -40,16 +40,8 @@ export class LlmClient {
       tool_calls?: ToolCallResult[];
     };
   }> {
-    const activeModel = this.getModel();
-    if (!this.apiKey) {
-      throw new Error('OPENROUTER_API_KEY belum dikonfigurasi. Isi pada file .env lokal backend.');
-    }
-    if (!activeModel) {
-      throw new Error('LLM_TOOL_MODEL atau LLM_DEFAULT_MODEL belum dikonfigurasi.');
-    }
-
     const payload = {
-      model: activeModel,
+      model: this.model,
       messages,
       tools: tools?.map((t) => ({
         type: 'function',
@@ -69,21 +61,19 @@ export class LlmClient {
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${this.apiKey}`,
-          ...(this.appUrl ? { 'HTTP-Referer': this.appUrl } : {}),
-          ...(this.appName ? { 'X-OpenRouter-Title': this.appName } : {}),
         },
         body: JSON.stringify(payload),
       });
 
       if (!res.ok) {
         const errorText = await res.text();
-        throw new Error(`OpenRouter error (${res.status}): ${errorText}`);
+        throw new Error(`LLM Gateway error (${res.status}): ${errorText}`);
       }
 
       const data = await res.json();
       return data.choices[0];
     } catch (err: any) {
-      this.logger.error(`Failed to invoke OpenRouter: ${err.message}`);
+      this.logger.error(`Failed to invoke LLM Gateway: ${err.message}`);
       throw err;
     }
   }

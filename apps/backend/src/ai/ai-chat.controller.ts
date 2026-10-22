@@ -1,16 +1,17 @@
+import { Body, Controller, Headers, Param, Post, Req } from '@nestjs/common';
 import { LlmClient } from './llm.client';
 import { AiToolsService } from './ai-tools.service';
 import { RESTAURANT_TOOLS } from './tools.definition';
 import { withOutletScope } from './prompts';
 import { PrismaService } from '../prisma/prisma.service';
+import { Prisma } from '@prisma/client';
+import { enforceRateLimit } from '../rate-limit.util';
+import { maskPhone } from './phone-mask.util';
 
-
-const ChatRateLimit = createRateLimitInterceptor({
-  windowMs: 60_000,
-  maxRequests: 20,
-  keyPrefix: 'ai-chat',
-  message: 'Batas pesan chat tercapai (maksimal 20 pesan/menit). Silakan tunggu sebentar.',
-});
+export interface ChatMessageRequest {
+  message: string;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+}
 
 type PendingMutation = { toolName: string; args: Record<string, any> };
 const MUTATION_TOOLS = new Set(['create_reservation', 'update_reservation', 'cancel_reservation']);
@@ -24,80 +25,82 @@ export class AiChatController {
   ) {}
 
   @Post(':tenantId')
-  @UseInterceptors(ChatRateLimit)
   async chat(
     @Param('tenantId') tenantId: string,
-    @Body() body: ChatMessageDto,
+    @Body() body: ChatMessageRequest,
     @Headers('x-session-id') sessionIdHeader?: string,
     @Req() request?: { ip?: string },
   ) {
-
-    const sessionId = await this.resolveSession(tenantId, sessionIdHeader);
-
-    if (this.isClearlyOutOfScope(body.message)) {
-      return {
-        sessionId,
-        reply: 'Maaf, saya hanya dapat membantu seputar informasi menu, cabang, dan reservasi meja di Rumah Makan Padang Sederhana. Ada yang bisa saya bantu terkait reservasi atau menu hari ini?',
-      };
-    }
-
-    // Handle rejection or cancellation of pending proposal
-    const explicitRejection = /^\s*(tidak|batal|batalkan|jangan|bukan|tidak jadi|gak jadi|nggak jadi)\b/i.test(body.message);
-    if (explicitRejection) {
-      const cleared = this.aiToolsService.clearPendingMutation(tenantId, sessionId);
-      if (cleared) {
-        return { sessionId, reply: 'Baik, perubahan atau pemesanan telah dibatalkan. Ada hal lain yang bisa saya bantu?' };
+    enforceRateLimit(`chat:${tenantId}:${request?.ip ?? 'unknown'}`, 20, 60_000);
+    const session = await this.getOrCreateSession(tenantId, sessionIdHeader);
+    const sessionId = session.id;
+    const pending = session.pendingMutation as PendingMutation | null;
+    if (pending) {
+      if (session.pendingMutationExpiresAt && session.pendingMutationExpiresAt <= new Date()) {
+        await this.clearPendingMutation(sessionId);
+      } else if (/^(batal|tidak|jangan)\b/i.test(body.message.trim())) {
+        await this.clearPendingMutation(sessionId);
+        return { sessionId, reply: 'Baik, tindakan reservasi dibatalkan.' };
+      } else if (this.isExplicitConfirmation(body.message)) {
+        const result = await this.aiToolsService.executeTool(
+          tenantId,
+          pending.toolName,
+          pending.args,
+          sessionId,
+        );
+        await this.clearPendingMutation(sessionId);
+        return { sessionId, reply: this.fallbackFromTools([{ name: pending.toolName, result }]) };
+      } else {
+        return {
+          sessionId,
+          reply: 'Masih ada tindakan reservasi yang menunggu persetujuan. Balas “ya” untuk melanjutkan atau kirim “batal”.',
+        };
       }
     }
+    // shortcut: the earliest active outlet is the chat scope; add an explicit outlet selector when multi-outlet chat is needed.
+    const outlet = await this.prisma.outlet.findFirst({
+      where: { tenantId, isActive: true },
+      select: { name: true, slug: true },
+      orderBy: { createdAt: 'asc' },
+    });
 
-    // Flexible affirmative confirmation matching
-    const explicitConfirmation = /^\s*(ya|iya|benar|betul|setuju|oke|ok|siap|lanjutkan|sudah sesuai|sesuai|ya benar|iya benar|oke lanjutkan|ya silakan|tolong lanjutkan|silakan proses|proses sekarang)\b/i.test(body.message);
-
-    if (explicitConfirmation) {
-      const confirmed = await this.aiToolsService.confirmPendingMutation(tenantId, sessionId);
-      if (!('error' in confirmed)) {
-        return { sessionId, reply: confirmed.message };
-      }
-      if (confirmed.error !== 'Tidak ada perubahan yang menunggu konfirmasi.') {
-        return { sessionId, reply: `Maaf, konfirmasi tidak dapat diproses: ${confirmed.error}` };
-      }
-    }
-
-    // Construct prompt history with reliable current date/time in restaurant timezone.
-    const now = new Date();
-    const currentWib = new Intl.DateTimeFormat('sv-SE', {
-      timeZone: 'Asia/Jakarta',
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-    }).format(now);
+    // Construct prompt history
     const conversation: any[] = [
-
+      { role: 'system', content: withOutletScope(outlet || undefined) },
+      ...(body.history || [])
+        .filter(
+          (h): h is { role: 'user' | 'assistant'; content: string } =>
+            (h?.role === 'user' || h?.role === 'assistant') && typeof h.content === 'string',
+        )
+        .map((h) => ({ role: h.role, content: h.content })),
       { role: 'user', content: body.message },
     ];
 
     // First LLM turn
     const firstResponse = await this.llmClient.chatCompletion(conversation, RESTAURANT_TOOLS);
-    let message = firstResponse.message;
-    let rawToolCalls = message.tool_calls || [];
-    if (!rawToolCalls.length && this.hasToolMarkup(message.content)) {
-      rawToolCalls = this.parseReadOnlyMarkup(message.content, body.message);
-      if (!rawToolCalls.length) {
-        const retry = await this.llmClient.chatCompletion([
-          ...conversation,
-          { role: 'system', content: 'Gunakan tool_calls terstruktur untuk mengambil data. Jangan menulis perintah tool sebagai teks jawaban.' },
-        ], RESTAURANT_TOOLS);
-        message = retry.message;
-        rawToolCalls = message.tool_calls || [];
-      }
-    }
+    const message = firstResponse.message;
 
     // Handle tool call chaining
+    if (message.tool_calls && message.tool_calls.length > 0) {
+      conversation.push(message);
+      const toolResults: Array<{ name: string; result: unknown }> = [];
+
+      for (const call of message.tool_calls) {
+        if (
+          !call?.id ||
+          typeof call.function?.name !== 'string' ||
+          typeof call.function?.arguments !== 'string'
+        ) {
+          toolResults.push({
+            name: 'invalid_tool_call',
+            result: { error: 'Respons tool dari AI tidak valid.' },
+          });
+          continue;
+        }
 
         let parsedArgs: Record<string, any> = {};
         try {
-          parsedArgs = typeof call.function.arguments === 'string'
-            ? JSON.parse(call.function.arguments)
-            : (call.function.arguments || {});
+          parsedArgs = JSON.parse(call.function.arguments);
         } catch {
           toolResults.push({
             name: call.function.name,
@@ -149,17 +152,31 @@ export class AiChatController {
         });
       }
 
-
+      // Second turn with tool result to generate natural response
+      const secondResponse = await this.llmClient.chatCompletion(conversation, RESTAURANT_TOOLS, 'none');
+      const reply = secondResponse.message.content?.trim();
+      return {
+        sessionId,
+        reply: reply && !reply.includes('<tool_call>')
+          ? reply
+          : this.fallbackFromTools(toolResults),
       };
     }
 
     return {
       sessionId,
-      reply: this.stripXmlToolCalls(message.content || 'Ada yang bisa kami bantu seputar menu dan reservasi Padang Sederhana?'),
+      reply: message.content || 'Ada yang bisa kami bantu seputar menu dan reservasi Padang Sederhana?',
     };
   }
 
-
+  private async getOrCreateSession(tenantId: string, sessionId?: string) {
+    if (sessionId) {
+      const existing = await this.prisma.chatSession.findFirst({
+        where: { id: sessionId, tenantId },
+        select: { id: true, pendingMutation: true, pendingMutationExpiresAt: true },
+      });
+      if (existing) return existing;
+    }
     const session = await this.prisma.chatSession.create({
       data: { tenantId },
       select: { id: true, pendingMutation: true, pendingMutationExpiresAt: true },

@@ -235,4 +235,14 @@ describe('ReservationsService', () => {
     }));
     jest.useRealTimers();
   });
+
+  it('rejects unavailable pre-order menu items instead of trusting client prices', async () => {
+    const preOrderService = new ReservationsService({
+      menuItem: { findMany: jest.fn().mockResolvedValue([]) },
+    } as never, {} as never);
+
+    await expect((preOrderService as any).resolvePreOrderItems('tenant-1', [
+      { menuItemId: 'other-tenant-menu', quantity: 1 },
+    ])).rejects.toBeInstanceOf(ConflictException);
+  });
 });
