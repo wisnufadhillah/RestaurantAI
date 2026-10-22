@@ -1,4 +1,16 @@
-import { IsInt, IsOptional, IsString, Matches, MaxLength, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+import { IsArray, IsInt, IsOptional, IsString, Matches, MaxLength, Min, ValidateNested } from 'class-validator';
+
+export class PreOrderItemDto {
+  @IsString() menuItemId: string;
+  @IsInt() @Min(1) quantity: number;
+  @IsOptional() @IsString() @MaxLength(300) notes?: string;
+}
+
+export class PreOrderDto {
+  @IsArray() @ValidateNested({ each: true }) @Type(() => PreOrderItemDto) items: PreOrderItemDto[];
+  @IsOptional() @IsString() @MaxLength(500) notes?: string;
+}
 
 export class CreateReservationDto {
   @IsString() outletId: string;
@@ -12,4 +24,5 @@ export class CreateReservationDto {
   @IsString()
   @MaxLength(128)
   idempotencyKey?: string;
+  @IsOptional() @ValidateNested() @Type(() => PreOrderDto) preOrder?: PreOrderDto;
 }
