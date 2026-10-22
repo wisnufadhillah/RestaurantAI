@@ -52,6 +52,21 @@ enum ActorType {
   system
 }
 
+enum PreOrderStatus {
+  confirmed
+  accepted
+  preparing
+  ready
+  served
+  cancelled
+  rejected
+}
+
+enum PaymentStatus {
+  pending
+  paid
+}
+
 model Tenant {
   id          String   @id @default(uuid()) @db.Uuid
   name        String
@@ -81,6 +96,7 @@ model Tenant {
   chatMessages             ChatMessage[]
   aiToolCalls              AiToolCall[]
   openingHours             OpeningHour[]
+  preOrders                PreOrder[]
   specialDays              SpecialDay[]
 
   @@map("tenants")
@@ -255,6 +271,7 @@ model MenuItem {
   tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   category        MenuCategory?    @relation(fields: [categoryId], references: [id], onDelete: SetNull)
   outletMenuItems OutletMenuItem[]
+  preOrderItems  PreOrderItem[]
 
   @@map("menu_items")
 }
@@ -319,11 +336,49 @@ model Reservation {
   table    RestaurantTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
 
   statusHistory ReservationStatusHistory[]
+  preOrder      PreOrder?
 
   @@unique([tenantId, code])
   @@index([tenantId, startAt])
   @@index([tenantId, tableId, startAt])
   @@map("reservations")
+}
+
+model PreOrder {
+  id            String         @id @default(uuid()) @db.Uuid
+  tenantId      String         @map("tenant_id") @db.Uuid
+  reservationId String         @unique @map("reservation_id") @db.Uuid
+  status        PreOrderStatus @default(confirmed)
+  subtotalIdr   Int            @map("subtotal_idr")
+  notes         String?
+  paymentMethod String         @default("pay_at_venue") @map("payment_method")
+  paymentStatus PaymentStatus  @default(pending) @map("payment_status")
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+
+  tenant      Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  items       PreOrderItem[]
+
+  @@index([tenantId, status])
+  @@map("pre_orders")
+}
+
+model PreOrderItem {
+  id            String   @id @default(uuid()) @db.Uuid
+  preOrderId    String   @map("pre_order_id") @db.Uuid
+  menuItemId    String   @map("menu_item_id") @db.Uuid
+  nameSnapshot  String   @map("name_snapshot")
+  unitPriceIdr  Int      @map("unit_price_idr")
+  quantity      Int
+  lineTotalIdr  Int      @map("line_total_idr")
+  notes         String?
+
+  preOrder PreOrder @relation(fields: [preOrderId], references: [id], onDelete: Cascade)
+  menuItem MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+
+  @@index([preOrderId])
+  @@map("pre_order_items")
 }
 
 model ReservationStatusHistory {

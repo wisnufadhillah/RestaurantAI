@@ -31,14 +31,57 @@ export class ReservationsService {
     if (!availability.available || !availability.startAt || !availability.endAt) {
       throw new ConflictException({ code: 'SLOT_TAKEN', message: 'Slot tidak tersedia.' });
     }
-
+    const preOrderItems = input.preOrder
+      ? await this.resolvePreOrderItems(outlet.tenantId, input.preOrder.items)
+      : [];
     const customer = await this.prisma.customer.upsert({
       where: { tenantId_phone: { tenantId: outlet.tenantId, phone: input.phone } },
       update: { name: input.name },
       create: { tenantId: outlet.tenantId, name: input.name, phone: input.phone },
     });
     try {
-
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${outlet.id}), hashtext(${input.date}))`;
+        const lockedAvailability = await this.availabilityService.find(
+          input.outletId,
+          input.date,
+          input.time,
+          input.partySize,
+          undefined,
+          tx,
+        );
+        if (!lockedAvailability.available || !lockedAvailability.startAt || !lockedAvailability.endAt) {
+          throw new ConflictException({ code: 'SLOT_TAKEN', message: 'Slot baru saja diambil tamu lain.' });
+        }
+        return tx.reservation.create({
+          data: {
+            tenantId: outlet.tenantId,
+            outletId: outlet.id,
+            customerId: customer.id,
+            tableId: lockedAvailability.tables[0].id,
+            startAt: lockedAvailability.startAt,
+            endAt: lockedAvailability.endAt,
+            partySize: input.partySize,
+            code: `RSV-${randomBytes(3).toString('hex').toUpperCase()}`,
+            notes: input.notes,
+            idempotencyKey: input.idempotencyKey,
+            expiresAt: new Date(Date.now() + this.pendingTtlMinutes() * 60_000),
+            ...(input.preOrder
+              ? {
+                  preOrder: {
+                    create: {
+                      tenantId: outlet.tenantId,
+                      subtotalIdr: preOrderItems.reduce((total, item) => total + item.lineTotalIdr, 0),
+                      notes: input.preOrder.notes,
+                      paymentMethod: 'pay_at_venue',
+                      paymentStatus: 'pending',
+                      items: { create: preOrderItems },
+                    },
+                  },
+                }
+              : {}),
+          },
+        });
       });
     } catch (error) {
       if (this.isIdempotencyConflict(error) && input.idempotencyKey) {
@@ -50,19 +93,13 @@ export class ReservationsService {
       if (this.isSlotConflict(error)) {
         throw new ConflictException({ code: 'SLOT_TAKEN', message: 'Slot baru saja diambil tamu lain.' });
       }
-      if (typeof error === 'object' && error !== null && 'code' in error && (error as { code: string }).code === 'P2002') {
-        throw new ConflictException({
-          code: 'DUPLICATE_IDEMPOTENCY_KEY',
-          message: 'Permintaan reservasi duplikat telah diproses sebelumnya.',
-        });
-      }
       throw error;
     }
   }
 
   async verify(code: string, phoneLast4: string, tenantId?: string) {
     const reservation = await this.prisma.reservation.findFirst({
-
+      where: { code, ...(tenantId ? { tenantId } : {}), customer: { phone: { endsWith: phoneLast4 } } },
       include: { outlet: true, table: true, customer: true },
     });
     if (!reservation) throw new NotFoundException('Reservasi tidak ditemukan.');
@@ -175,13 +212,7 @@ export class ReservationsService {
 
   async expirePending(now = new Date()) {
     const expired = await this.prisma.reservation.findMany({
-      where: {
-        status: 'pending',
-        OR: [
-          { expiresAt: { lte: now } },
-          { startAt: { lte: now } },
-        ],
-      },
+      where: { status: 'pending', expiresAt: { lte: now } },
       select: { id: true, tenantId: true },
     });
     if (expired.length === 0) return { expired: 0 };
@@ -190,14 +221,7 @@ export class ReservationsService {
     for (const item of expired) {
       await this.prisma.$transaction(async (tx) => {
         const changed = await tx.reservation.updateMany({
-          where: {
-            id: item.id,
-            status: 'pending',
-            OR: [
-              { expiresAt: { lte: now } },
-              { startAt: { lte: now } },
-            ],
-          },
+          where: { id: item.id, status: 'pending', expiresAt: { lte: now } },
           data: { status: 'expired', version: { increment: 1 } },
         });
         if (changed.count !== 1) return;
@@ -228,8 +252,7 @@ export class ReservationsService {
     return { expired: count };
   }
 
-  async list(tenantId: string, query: ListReservationsDto) {
-    await this.expirePending().catch(() => ({ expired: 0 }));
+  list(tenantId: string, query: ListReservationsDto) {
     const search = query.query?.trim();
     return this.prisma.reservation.findMany({
       where: {
@@ -259,61 +282,6 @@ export class ReservationsService {
 
   reject(tenantId: string, actorId: string, id: string, reason?: string) {
     return this.changeStatus(tenantId, actorId, id, 'rejected', reason);
-  }
-
-  complete(tenantId: string, actorId: string, id: string) {
-    return this.changeAttendanceStatus(tenantId, actorId, id, 'completed');
-  }
-
-  markNoShow(tenantId: string, actorId: string, id: string) {
-    return this.changeAttendanceStatus(tenantId, actorId, id, 'no_show');
-  }
-
-  private async changeAttendanceStatus(
-    tenantId: string,
-    actorId: string,
-    id: string,
-    status: 'completed' | 'no_show',
-  ) {
-    return this.prisma.$transaction(async (tx) => {
-      const reservation = await tx.reservation.findFirst({ where: { id, tenantId } });
-      if (!reservation) throw new NotFoundException('Reservasi tidak ditemukan.');
-      if (reservation.status !== 'confirmed') {
-        throw new ConflictException('Hanya reservasi terkonfirmasi yang dapat ditutup.');
-      }
-
-      const updated = await tx.reservation.updateMany({
-        where: { id, tenantId, status: 'confirmed', version: reservation.version },
-        data: { status, version: { increment: 1 } },
-      });
-      if (updated.count !== 1) throw new ConflictException('Status reservasi telah berubah.');
-
-      const after = await tx.reservation.findUniqueOrThrow({ where: { id } });
-      await tx.reservationStatusHistory.create({
-        data: {
-          tenantId,
-          reservationId: id,
-          fromStatus: 'confirmed',
-          toStatus: status,
-          actorType: 'staff',
-          actorId,
-          reason: status === 'completed' ? 'Tamu hadir dan reservasi selesai' : 'Tamu tidak hadir',
-        },
-      });
-      await tx.auditEvent.create({
-        data: {
-          tenantId,
-          actorType: 'staff',
-          actorId,
-          action: `reservation.${status}`,
-          entityType: 'reservation',
-          entityId: id,
-          before: { status: 'confirmed' },
-          after: { status },
-        },
-      });
-      return after;
-    });
   }
 
   private async changeStatus(
@@ -369,6 +337,44 @@ export class ReservationsService {
 
   private isSlotConflict(error: unknown) {
     if (typeof error !== 'object' || error === null) return false;
+    const { code, cause } = error as { code?: string; cause?: { code?: string } };
+    return ['P2010', 'P2034', '23P01', '40P01'].includes(code ?? cause?.code ?? '');
+  }
 
+  private isIdempotencyConflict(error: unknown) {
+    if (typeof error !== 'object' || error === null) return false;
+    const { code, cause } = error as { code?: string; cause?: { code?: string } };
+    return (code ?? cause?.code) === 'P2002';
+  }
+
+  private pendingTtlMinutes() {
+    const configured = Number(process.env.RESERVATION_PENDING_TTL_MINUTES ?? 15);
+    return Number.isFinite(configured) && configured > 0 ? configured : 15;
+  }
+
+  private async resolvePreOrderItems(
+    tenantId: string,
+    items: Array<{ menuItemId: string; quantity: number; notes?: string }>,
+  ) {
+    if (items.length === 0) throw new ConflictException('Pre-order harus memiliki minimal satu item.');
+    const menuItems = await this.prisma.menuItem.findMany({
+      where: { tenantId, isActive: true, isAvailable: true, id: { in: items.map((item) => item.menuItemId) } },
+      select: { id: true, name: true, priceIdr: true },
+    });
+    const byId = new Map(menuItems.map((item) => [item.id, item]));
+    if (byId.size !== new Set(items.map((item) => item.menuItemId)).size) {
+      throw new ConflictException('Satu atau lebih menu tidak tersedia.');
+    }
+    return items.map((item) => {
+      const menuItem = byId.get(item.menuItemId)!;
+      return {
+        menuItemId: menuItem.id,
+        nameSnapshot: menuItem.name,
+        unitPriceIdr: menuItem.priceIdr,
+        quantity: item.quantity,
+        lineTotalIdr: menuItem.priceIdr * item.quantity,
+        notes: item.notes,
+      };
+    });
   }
 }
